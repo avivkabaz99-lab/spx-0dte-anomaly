@@ -6,7 +6,7 @@ from a dict, which is all the recorder ever reads from it.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from datetime import time as clock_time
 from pathlib import Path
 
@@ -75,6 +75,8 @@ class FakeAdapter:
     def __init__(self, quotes: dict[int, Quote] | None = None) -> None:
         self._quotes = quotes or {}
         self.is_connected = True
+        self.market_data_ok = True
+        self.subscriptions_lost = False
         self.subscribed: list[int] = []
         self.cancelled: list[int] = []
         self.bars: list[Bar] = []
@@ -295,6 +297,65 @@ def test_run_stops_when_the_connection_drops(tmp_path: Path) -> None:
     """Sampling a dead connection would write stale quotes that look valid."""
     api = FakeAdapter({1: quote()})
     api.is_connected = False
+    sink = ParquetSink(tmp_path)
+    recorder = Recorder(api, sink, interval=0.01)  # type: ignore[arg-type]
+
+    recorder.run(until=datetime(2099, 1, 1, tzinfo=UTC))
+
+    assert recorder.samples == 0
+    assert sink.buffer == []
+
+
+def test_run_skips_samples_while_the_feed_is_down(tmp_path: Path) -> None:
+    """The regression: a network cut froze the book and 8 minutes were written.
+
+    `is_connected` stays true through it — IB Gateway is on localhost, so the
+    socket never notices — which is exactly why this is a separate guard.
+    """
+    api = FakeAdapter({1: quote()})
+    api.market_data_ok = False
+    sink = ParquetSink(tmp_path)
+    recorder = Recorder(api, sink, interval=0.01)  # type: ignore[arg-type]
+
+    stop_at = datetime.now(UTC) + timedelta(seconds=0.05)
+    recorder.run(until=stop_at)
+
+    assert api.is_connected, "the local socket survives a network cut; the test must too"
+    assert recorder.samples == 0
+    assert recorder.skipped > 0
+    assert sink.buffer == []
+    assert list(tmp_path.rglob("*.parquet")) == []
+
+
+def test_run_resumes_after_the_feed_returns(tmp_path: Path) -> None:
+    """1102 restores the streams, so the loop must resume, not stay parked."""
+    api = FakeAdapter({1: quote()})
+    api.market_data_ok = False
+    sink = ParquetSink(tmp_path)
+    recorder = Recorder(api, sink, interval=0.01)  # type: ignore[arg-type]
+
+    real_sleep = recorder._wait_until
+
+    def wait(deadline: float) -> None:
+        # The feed comes back while the loop is parked, the way 1102 arrives.
+        api.market_data_ok = True
+        real_sleep(deadline)
+
+    recorder._wait_until = wait  # type: ignore[method-assign]
+    recorder.run(until=datetime.now(UTC) + timedelta(seconds=0.05))
+
+    assert recorder.skipped == 0, "the counter resets once the feed is back"
+    assert recorder.samples > 0
+
+
+def test_run_stops_when_tws_drops_the_subscriptions(tmp_path: Path) -> None:
+    """1101 means the link returned but every stream must be re-issued.
+
+    Carrying on would record a chain nothing is feeding, so the recorder exits
+    and lets a fresh process resubscribe from a known state.
+    """
+    api = FakeAdapter({1: quote()})
+    api.subscriptions_lost = True
     sink = ParquetSink(tmp_path)
     recorder = Recorder(api, sink, interval=0.01)  # type: ignore[arg-type]
 

@@ -300,6 +300,10 @@ class Recorder:
         self._spot = SpotPoll(api)
         self._stop = threading.Event()
         self.samples = 0
+        # Samples deliberately not taken because the feed was down. Counted so
+        # the gap is visible in the log and reported at the end, rather than
+        # showing up months later as an unexplained hole in a backtest.
+        self.skipped = 0
 
     def stop(self) -> None:
         """Ask the loop to finish after the current sample."""
@@ -349,12 +353,39 @@ class Recorder:
         deadline = time.monotonic()
         try:
             while not self._stop.is_set() and datetime.now(UTC) < until:
-                # A dropped connection leaves the last tick of every contract in
-                # place, so sampling on would write minutes of stale quotes that
-                # look valid. Stopping lets the launchd agent start a fresh one.
+                # A dropped feed leaves the last tick of every contract in place,
+                # so sampling on would write minutes of stale quotes that look
+                # valid. Stopping lets the launchd agent start a fresh one.
                 if not self._api.is_connected:
                     logger.error("TWS connection lost after %d samples; stopping", self.samples)
                     return
+
+                # TWS restored the link but dropped the streams. Every
+                # subscription would have to be re-issued, and a fresh process
+                # does that from a known state; carrying on would record a chain
+                # nothing is feeding.
+                if self._api.subscriptions_lost:
+                    logger.error("TWS 1101: subscriptions dropped after %d samples; "
+                                 "stopping so a fresh recorder resubscribes", self.samples)
+                    return
+
+                # The link out to IBKR is down while the local socket is fine.
+                # This recovers on its own, so the loop pauses rather than
+                # exiting: exiting would cost a full 484-contract resubscription
+                # and up to half an hour of launchd wait for an outage that
+                # typically clears in minutes.
+                if not self._api.market_data_ok:
+                    self.skipped += 1
+                    if self.skipped == 1 or self.skipped % 10 == 0:
+                        logger.warning("market data feed is down; skipped %d sample(s), "
+                                       "writing nothing until it returns", self.skipped)
+                    deadline += self._interval
+                    self._wait_until(deadline)
+                    continue
+                if self.skipped:
+                    logger.info("market data feed is back after %d skipped sample(s)",
+                                self.skipped)
+                    self.skipped = 0
                 started = time.monotonic()
                 count = self.sample()
                 logger.debug("sample %d: %d rows in %.2fs",
@@ -434,7 +465,8 @@ def main() -> int:
         api.unsubscribe_all()
         api.close()
 
-    logger.info("stopped after %d samples", recorder.samples)
+    logger.info("stopped after %d samples, %d skipped while the feed was down",
+                recorder.samples, recorder.skipped)
     return 0
 
 

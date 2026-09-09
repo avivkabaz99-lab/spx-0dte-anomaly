@@ -389,3 +389,94 @@ def test_ticks_for_an_unknown_request_are_ignored(adapter: IBKRAdapter) -> None:
     adapter.tickSize(4242, 0, 10)
     adapter.marketDataType(4242, 3)
     assert adapter.quotes() == {}
+
+
+# -- connectivity, one layer above the socket ------------------------------
+
+
+def farm_error(adapter: IBKRAdapter, code: int, message: str) -> None:
+    """Fire the `error` callback the way TWS 10.30+ does, with `errorTime`."""
+    adapter.error(-1, 0, code, message, "")
+
+
+def test_market_data_is_ok_before_tws_says_otherwise(adapter: IBKRAdapter) -> None:
+    """TWS announces broken farms, never healthy ones at connect time.
+
+    Starting pessimistic would park the recorder before its first sample and
+    never release it, since the clearing notice is not coming.
+    """
+    adapter.isConnected = lambda: True  # type: ignore[method-assign]
+    assert adapter.market_data_ok
+
+
+def test_a_broken_farm_closes_market_data(adapter: IBKRAdapter) -> None:
+    adapter.isConnected = lambda: True  # type: ignore[method-assign]
+    farm_error(adapter, 2103, "Market data farm connection is broken:usopt")
+    assert not adapter.market_data_ok
+
+
+def test_farms_recover_one_at_a_time(adapter: IBKRAdapter) -> None:
+    """Each farm is announced separately, so one recovering is not all of them."""
+    adapter.isConnected = lambda: True  # type: ignore[method-assign]
+    farm_error(adapter, 2103, "Market data farm connection is broken:usopt")
+    farm_error(adapter, 2103, "Market data farm connection is broken:usfarm")
+
+    farm_error(adapter, 2104, "Market data farm connection is OK:usopt")
+    assert not adapter.market_data_ok, "usfarm is still down"
+
+    farm_error(adapter, 2104, "Market data farm connection is OK:usfarm")
+    assert adapter.market_data_ok
+
+
+def test_an_inactive_farm_is_not_an_outage(adapter: IBKRAdapter) -> None:
+    """2108 is routine; treating it as down would pause the recorder for nothing."""
+    adapter.isConnected = lambda: True  # type: ignore[method-assign]
+    farm_error(adapter, 2108,
+               "Market data farm connection is inactive but should be "
+               "available upon demand.usfarm")
+    assert adapter.market_data_ok
+
+
+def test_the_network_cut_of_2026_09_09(adapter: IBKRAdapter) -> None:
+    """Replays the exact code sequence the fault injection produced.
+
+    The socket to TWS stays up throughout — IB Gateway is on localhost — which
+    is why `is_connected` alone let eight minutes of frozen quotes through.
+    """
+    adapter.isConnected = lambda: True  # type: ignore[method-assign]
+
+    for farm in ("usopt", "usfarm.nj", "usfarm"):
+        farm_error(adapter, 2103, f"Market data farm connection is broken:{farm}")
+    farm_error(adapter, 2105, "HMDS data farm connection is broken:ushmds")
+    farm_error(adapter, 1100, "Connectivity between IBKR and TWS has been lost.")
+
+    assert adapter.is_connected, "the local socket never noticed"
+    assert not adapter.market_data_ok
+
+    farm_error(adapter, 1102,
+               "Connectivity between IBKR and TWS has been restored - data "
+               "maintained. All data farms are connected: usfarm.nj; usopt; "
+               "usfarm; ushmds; secdefnj.")
+    for farm in ("usopt", "usfarm.nj", "usfarm"):
+        farm_error(adapter, 2104, f"Market data farm connection is OK:{farm}")
+
+    assert adapter.market_data_ok
+    assert not adapter.subscriptions_lost, "1102 keeps the streams"
+
+
+def test_1101_latches_subscriptions_lost(adapter: IBKRAdapter) -> None:
+    """1101 restores the link but drops every stream; there is no undo notice."""
+    adapter.isConnected = lambda: True  # type: ignore[method-assign]
+    farm_error(adapter, 1100, "Connectivity between IBKR and TWS has been lost.")
+    farm_error(adapter, 1101,
+               "Connectivity between IBKR and TWS has been restored - data lost.")
+
+    assert adapter.market_data_ok, "the link itself is back"
+    assert adapter.subscriptions_lost
+    farm_error(adapter, 2104, "Market data farm connection is OK:usopt")
+    assert adapter.subscriptions_lost, "latched: nothing clears it"
+
+
+def test_a_dead_socket_still_closes_market_data(adapter: IBKRAdapter) -> None:
+    adapter.isConnected = lambda: False  # type: ignore[method-assign]
+    assert not adapter.market_data_ok

@@ -64,6 +64,35 @@ MAX_TICKERS_CODE = 101
 # subscription per strike they would otherwise flood the log at WARNING.
 MARKET_DATA_NOTICE_CODES = frozenset({10090, 10091, 10167})
 
+# Connectivity notices for the link from TWS *out to IBKR*, one layer above the
+# local socket. They matter because `isConnected()` cannot see that layer: IB
+# Gateway runs on this machine, so pulling the network leaves the loopback
+# socket perfectly healthy while no quote arrives for minutes. Verified by
+# fault injection on 2026-09-09 (see DECISIONS.md).
+FARM_BROKEN_CODE = 2103
+FARM_OK_CODE = 2104
+
+# "inactive but should be available upon demand" — routine, not a failure. It
+# is listed to make the omission from the broken set deliberate rather than an
+# oversight; treating it as an outage would pause the recorder for no reason.
+FARM_INACTIVE_CODE = 2108
+
+# 2105/2106 are the *historical* (HMDS) farm, and are deliberately not folded
+# into `market_data_ok`. HMDS feeds only the spot poll, which already degrades
+# by keeping its previous value and its original timestamp. Gating the chain on
+# it would stop recording live option quotes over a stale index.
+HMDS_FARM_BROKEN_CODE = 2105
+HMDS_FARM_OK_CODE = 2106
+
+CONNECTIVITY_LOST_CODE = 1100
+
+# 1101 and 1102 both mean the link is back, and the difference is the whole
+# point: after 1102 the subscriptions survived, after 1101 they did not and
+# every one must be re-established. A caller that treats them alike either
+# resubscribes needlessly or streams a chain TWS is no longer feeding.
+CONNECTIVITY_RESTORED_LOST_SUBS_CODE = 1101
+CONNECTIVITY_RESTORED_CODE = 1102
+
 
 class IBKRError(RuntimeError):
     """An error TWS returned for a specific request."""
@@ -247,6 +276,12 @@ class IBKRAdapter(EWrapper, EClient):
         self._next_request_id = _FIRST_REQUEST_ID
         self._reader: threading.Thread | None = None
         self._ready = threading.Event()
+        # Farms are assumed up until TWS says otherwise: it announces a broken
+        # farm but not a healthy one at connect time, so starting pessimistic
+        # would block the first sample of every session forever.
+        self._broken_farms: set[str] = set()
+        self._connectivity_lost = False
+        self._subscriptions_lost = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -277,6 +312,59 @@ class IBKRAdapter(EWrapper, EClient):
     def is_connected(self) -> bool:
         """False once TWS drops the socket, including its own daily restart."""
         return bool(self.isConnected())
+
+    @property
+    def market_data_ok(self) -> bool:
+        """True while quotes can be trusted to still be arriving.
+
+        `is_connected` is necessary but not sufficient. It watches the socket to
+        TWS, which is a loopback connection here and survives a network cut; the
+        farm and connectivity notices are the only visibility into the link that
+        actually carries the data. A caller that samples on this being False
+        records the last tick of every contract over and over, and the result is
+        indistinguishable from live data in every field but `quote_ts`.
+        """
+        with self._lock:
+            return (
+                self.is_connected
+                and not self._connectivity_lost
+                and not self._broken_farms
+            )
+
+    @property
+    def subscriptions_lost(self) -> bool:
+        """True once TWS reported `1101`: the link is back, the streams are not.
+
+        Latched, never cleared, because there is no second notice to clear it
+        on. Every `reqMktData` must be re-issued; the recorder stops instead and
+        lets a fresh process resubscribe the chain from scratch.
+        """
+        with self._lock:
+            return self._subscriptions_lost
+
+    def _note_connectivity(self, code: int, message: str) -> bool:
+        """Fold one connectivity notice into farm state. True if it was one.
+
+        Farm names arrive as a suffix, `"...is broken:usopt"`, and each farm is
+        announced separately, so the broken ones are tracked as a set rather
+        than a flag: `usopt` recovering does not mean `usfarm` has.
+        """
+        farm = message.rsplit(":", 1)[-1].strip() if ":" in message else message.strip()
+        with self._lock:
+            if code == FARM_BROKEN_CODE:
+                self._broken_farms.add(farm)
+            elif code == FARM_OK_CODE:
+                self._broken_farms.discard(farm)
+            elif code == CONNECTIVITY_LOST_CODE:
+                self._connectivity_lost = True
+            elif code == CONNECTIVITY_RESTORED_CODE:
+                self._connectivity_lost = False
+            elif code == CONNECTIVITY_RESTORED_LOST_SUBS_CODE:
+                self._connectivity_lost = False
+                self._subscriptions_lost = True
+            else:
+                return False
+        return True
 
     def __enter__(self) -> IBKRAdapter:
         self.open()
@@ -509,6 +597,14 @@ class IBKRAdapter(EWrapper, EClient):
         position: `errorCode` is always the int immediately before `errorString`.
         """
         code, message = _split_error_args(args)
+
+        # Before the info-range filter: the farm notices sit inside 2100-2200
+        # and would otherwise be logged and dropped, which is exactly how an
+        # eight-minute outage went unnoticed once already.
+        if self._note_connectivity(code, message):
+            logger.warning("TWS %s: %s — market_data_ok=%s", code, message,
+                           self.market_data_ok)
+            return
 
         if _INFO_CODE_MIN <= code <= _INFO_CODE_MAX:
             logger.info("TWS %s: %s", code, message)

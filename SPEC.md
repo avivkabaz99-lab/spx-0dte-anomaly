@@ -119,6 +119,8 @@ Consequences, enforced in code:
 ```
 src/spx0dte/
 ├── ingest/      recorder.py (chain → Parquet), index_history.py, cboe.py
+│                ibkr_adapter.py wraps the callback-based official `ibapi`
+│                client; nothing else imports `ibapi` directly
 ├── pricing/     Black-Scholes, greeks, IV solver, parity + butterfly checks
 ├── surface/     SVI fit + residuals
 ├── features/    feature engineering for both modules
@@ -136,7 +138,7 @@ supabase/migrations/
 BrokerInterface (Protocol)
 ├── NullBroker    records intent, places nothing        ← default, read-only
 ├── PaperBroker   simulated fills against recorded bid/ask   (step 5)
-└── IBKRBroker    ib_insync, behind an env flag, disabled    (not before live)
+└── IBKRBroker    official ibapi, behind an env flag, disabled (not before live)
 ```
 
 `RiskManager` — max positions, max daily loss, max order size, trading-hours

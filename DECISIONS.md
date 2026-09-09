@@ -76,11 +76,22 @@ that determines whether steps 2–7 are ordered correctly.
 
 ---
 
-## OPEN — `ib_insync` vs `ib_async`
+## 2026-09-09 — Broker client is the official `ibapi`, not `ib_insync`
 
-`ib_insync` is the standing default in the user's global config, and is what
-`pyproject.toml` currently declares. The upstream project was archived in 2024;
-`ib_async` is the community-maintained fork with the same API.
+**Decided:** use IBKR's official Python API (`ibapi`, TWS API 10.45).
 
-Decide before writing `ingest/recorder.py`. Not decided unilaterally because
-`ib_insync` is an explicit stated preference.
+**Why:** `ib_insync` was archived in 2024 and `ib_async` is a third-party fork;
+the official client has no maintainer risk and tracks new API features first.
+It is also the client used professionally at an IBKR introducing broker.
+
+**Cost accepted:** `ibapi` is callback-based (`EWrapper`/`EClient` plus a reader
+thread), not `async`/`await`. `ingest/` therefore carries a thin adapter that
+turns callbacks into plain data structures; nothing outside `ingest/` and
+`execution/` should import `ibapi` directly.
+
+**Install:** PyPI's `ibapi` is a stale 9.81 mirror, and the API is under the IB
+API Non-Commercial License, so the source is not vendored into this public
+repo. `scripts/install_ibapi.sh` downloads the pinned official zip, verifies its
+SHA-256, and installs the Python client into `.venv`.
+
+**Reverses if:** IBKR publishes a current `ibapi` on PyPI (then drop the script).

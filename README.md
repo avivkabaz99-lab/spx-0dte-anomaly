@@ -30,8 +30,9 @@ grant on the raw quote columns. `tests/test_rls.py` fails if that regresses.
 ```bash
 uv venv --python 3.12
 uv pip install -e ".[dev,model]"
-cp .env.example .env      # then fill values from your password manager
-pytest
+./scripts/install_ibapi.sh   # official IBKR client; see the script header for why
+cp .env.example .env         # then fill values from your password manager
+.venv/bin/pytest
 ```
 
 Apply the database schema:

@@ -2,50 +2,41 @@
 
 ## 0. Where we are (updated 2026-09-09)
 
-**Step 0 of the roadmap is complete except for one verification.**
+**Step 0 of the roadmap is complete. The full suite is green.**
 
 | Done | Verified |
 |---|---|
-| Public repo `avivkabaz99-lab/spx-0dte-anomaly`, secret scanning + push protection on | ✅ |
-| Supabase project `spx-0dte-anomaly` (`rpcrwskakgkdivgjxvbv`, us-east-2), linked | ✅ |
-| 3 migrations pushed, remote == local | ✅ `supabase migration list` |
-| `.venv` with dev deps + `ibapi 10.45.1` | ✅ import check |
-| Secrets-hygiene tests | ✅ 12 passed |
-| **RLS tests — the OPRA boundary** | ❌ **15 skipped** — `.env` not filled |
+| Public repo `avivkabaz99-lab/spx-0dte-anomaly`, secret scanning + push protection on | OK |
+| Supabase project `spx-0dte-anomaly` (`rpcrwskakgkdivgjxvbv`, us-east-2), linked | OK |
+| 3 migrations pushed, remote == local | OK `supabase migration list` |
+| `.venv` with dev deps + `ibapi 10.45.1` | OK import check |
+| Secrets-hygiene tests | OK 12 passed |
+| **RLS tests — the OPRA boundary** | **OK — 27 passed, 0 skipped** |
 
-`.env` exists with `SUPABASE_URL` prefilled. The other three keys are **empty on
-disk** as of the last check — the user edited in Cursor but the values did not
-reach the file (unsaved, wrong tab, or wrong folder). Nothing leaked:
-`.env.example` is untouched per `git status`.
+`.env` is filled. `.env.example` untouched, `git status` clean.
 
-## 1. Next action — exactly this, in order
+### Connecting to the database — settled, do not re-derive
 
-1. User fills three values in `~/Developer/spx-0dte-anomaly/.env` **from the editor**:
-   - `SUPABASE_ANON_KEY` — Dashboard → Project Settings → API Keys → legacy tab → `anon`
-     (or `sb_publishable_…` from the new tab)
-   - `SUPABASE_SERVICE_ROLE_KEY` — same screen → `service_role` → Reveal
-     (or create a `sb_secret_…` key; shown once)
-   - `SUPABASE_DB_URL` — top bar → Connect → URI → **Session pooler** (`:5432/`),
-     `[YOUR-PASSWORD]` replaced
-   Then **Cmd+S** and confirm the tab is named `.env`, not `.env.example`.
+The Session pooler host was verified against the live server by probing both
+candidates with a dummy password: `aws-0` answered `password authentication
+failed` (knows the tenant), `aws-1` answered `tenant/user not found`.
 
-2. Verify shape without reading values:
-   ```bash
-   .venv/bin/python -c "
-   import os; from dotenv import load_dotenv; load_dotenv('.env')
-   for k in ('SUPABASE_ANON_KEY','SUPABASE_SERVICE_ROLE_KEY','SUPABASE_DB_URL'):
-       v=os.environ.get(k,''); print(k, 'EMPTY' if not v else f'set ({len(v)} chars)')"
-   ```
-   Note `load_dotenv('.env')` with the explicit path — the bare call fails from stdin.
+```
+SUPABASE_DB_URL=postgresql://postgres.rpcrwskakgkdivgjxvbv:<pw>@aws-0-us-east-2.pooler.supabase.com:5432/postgres
+```
 
-3. Run the suite:
-   ```bash
-   .venv/bin/pytest -q 2>&1 | sed -E 's#postgres(ql)?://[^[:space:]]+#postgresql://***#g'
-   ```
-   **Success = 27 passed, 0 skipped.** If any RLS test fails, the database is
-   exposing something it must not; fix the migration, do not weaken the test.
+Direct connection (`db.<ref>.supabase.co`) is **IPv6-only and unreachable** from
+this machine. Use the pooler.
 
-## 2. After that — roadmap step 1: the IBKR spike
+The DB password contains `@`, `/`, `%` and `&`, so it **must be percent-encoded**
+inside the URI. Hand-editing it into the middle of the line breaks the URI every
+time — those characters are the URI delimiters. If the password is ever rotated,
+re-encode it with a script rather than by hand: paste the raw password into a
+temporary `TEMP_DB_PASSWORD=` line, then build the URI with
+`urllib.parse.quote(pw, safe='')`, write it to `SUPABASE_DB_URL`, and delete the
+temporary line. The value is never printed or pasted into chat.
+
+## 1. Next action — roadmap step 1: the IBKR spike
 
 Half a day. Two assumptions in `DECISIONS.md` are unverified and order the whole
 roadmap. Measure them with `ibapi` against TWS **paper (7497)**, read-only:
@@ -61,7 +52,7 @@ Write the result into `DECISIONS.md` under the OPEN item. If expired contracts
 Then step 2: `ingest/recorder.py` on a cron, because every trading day without
 it is a day missing from Module A's dataset.
 
-## 3. Things a new session will not guess
+## 2. Things a new session will not guess
 
 - `supabase db push` needs **no DB password** — the CLI mints a login role from the
   access token. Only the pytest connection needs `SUPABASE_DB_URL`.

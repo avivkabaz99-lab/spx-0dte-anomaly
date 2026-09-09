@@ -12,9 +12,12 @@ Shape of the thing, and why:
 - Sampling costs no requests. `reqMktData` streams, the adapter keeps the last
   tick per contract, and a sample is a local read. The ~60 requests / 10 min
   historical limit therefore does not apply to this loop at all.
-- Spot is polled, not streamed: this account is not entitled to the SPX index
-  quote and `undPrice` never arrives on the greeks, while `reqHistoricalData` on
-  the same contract does work.
+- Spot is the one field this account cannot get live. The SPX index is not
+  entitled for streaming and `undPrice` never arrives on the greeks, so spot is
+  polled from a historical bar that runs ~16 minutes behind the tape. It is
+  written with its own `spot_ts` and is never passed off as current: anything
+  needing a spot at quote time recovers it from put-call parity on the recorded
+  chain, which is entitled, live, and stored at every strike.
 - Missing stays missing. A one-sided wing writes null, never 0.0.
 
 Raw quotes stay on this machine: `data/` and `*.parquet` are gitignored, and
@@ -67,14 +70,24 @@ SESSION_END = clock_time(16, 15)
 # one message, and the chain is opened in a single pass.
 SUBSCRIBE_GAP = 0.05
 
-# `undPrice` never arrives, so spot comes from a one-minute historical bar.
-# Polling more often than this buys nothing: the bar itself is one minute wide.
-SPOT_MAX_AGE = 45.0
+# `undPrice` never arrives and the index is not entitled for streaming, so spot
+# comes from a historical bar. That feed is *delayed by about 16 minutes* on
+# this account, which dictates the window: a request only answers if it reaches
+# back further than the delay. A "60 S" window can therefore never contain a
+# bar, and "1 D" is empty for the first ~20 minutes of a session because it is
+# scoped to a day the delayed feed has not reached yet. "2 D" always spans the
+# lag and the weekend, and 1 min is the finest bar the account does serve.
+SPOT_DURATION = "2 D"
+SPOT_BAR_SIZE = "1 min"
 
-# The index is only published during regular hours, so before the open the poll
-# legitimately returns the previous close. Past this age inside a session it
-# means the feed has stopped, which the operator needs to hear about.
-SPOT_STALE_AFTER = 300.0
+# Bars are a minute wide, so polling faster buys nothing. One request a minute
+# is also well inside the ~60 requests / 10 min historical limit.
+SPOT_MAX_AGE = 60.0
+
+# Spot trails the tape by the feed's ~16 min delay, so that much age is normal
+# and must not warn. Past this it means the feed stopped, which the operator
+# needs to hear. Before the open it is legitimately hours old and says so.
+SPOT_STALE_AFTER = 1800.0
 
 SCHEMA = pa.schema([
     ("ts", pa.timestamp("us", tz="UTC")),
@@ -179,8 +192,8 @@ class SpotPoll:
             return self._value, self._ts
         try:
             bars = self._api.historical_bars(
-                spx_index(), duration="60 S", bar_size="1 min",
-                what_to_show="TRADES", use_rth=False,
+                spx_index(), duration=SPOT_DURATION, bar_size=SPOT_BAR_SIZE,
+                what_to_show="TRADES", use_rth=True,
             )
         except (IBKRError, IBKRTimeoutError) as exc:
             logger.warning("spot poll failed, keeping %s: %s", self._value, exc)

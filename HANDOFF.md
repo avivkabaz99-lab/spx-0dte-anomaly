@@ -10,13 +10,23 @@
 | Supabase project `spx-0dte-anomaly` (`rpcrwskakgkdivgjxvbv`, us-east-2), linked | OK |
 | 3 migrations pushed, remote == local | OK `supabase migration list` |
 | `.venv` with dev deps + `ibapi 10.45.1` | OK import check |
+| `model` extra: `lightgbm 4.7`, `scikit-learn 1.9` | OK import check |
 | Secrets-hygiene tests | OK 12 passed |
 | **RLS tests — the OPRA boundary** | **OK — 27 passed, 0 skipped** |
+| **First live session recording, 2026-09-09** | **OK — chain clean, see `DECISIONS.md`** |
 
 **Steps 1 and 2a-2c are complete too.** The adapter also streams market data
 (`subscribe` / `quotes` / `unsubscribe`), `scripts/spike_marketdata.py` measured
 what this account actually receives, and `ingest/recorder.py` writes the chain to
-Parquet. Suite: **73 passed**.
+Parquet. Suite: **74 passed**.
+
+**LightGBM needs Homebrew `libomp` on this Mac.** `uv pip install lightgbm` alone
+gives an import-time `dlopen` failure on `@rpath/libomp.dylib`; `brew install
+libomp` fixes it. It is a system package, so a fresh machine needs it again.
+
+**`pandas 3.0.5` is what is installed**, while `pyproject.toml` only asks for
+`>=2.2`. 3.0 changed copy-on-write and the default string dtype. Nothing depends
+on it yet — the feature code for Module B is the first thing that will.
 
 `.env` is filled. `.env.example` untouched, `git status` clean.
 
@@ -41,12 +51,25 @@ temporary `TEMP_DB_PASSWORD=` line, then build the URI with
 `urllib.parse.quote(pw, safe='')`, write it to `SUPABASE_DB_URL`, and delete the
 temporary line. The value is never printed or pasted into chat.
 
-## 1. Next action — start today's recording, then step 2d (backfill)
+## 1. Next action — four more clean sessions, then step 2d (backfill)
 
-Steps 1, 2a, 2b and 2c are done. `ingest/recorder.py` records the full SPXW 0DTE
-chain and was smoke-run live against IB Gateway: 484 contracts, 242 strikes,
-C/P balanced, iv on 100% of rows, two-sided on 70%, ~392k rows and ~21 MB per
-session at a 30-second interval. Suite: **73 passed**.
+Steps 1, 2a, 2b and 2c are done, and **2026-09-09 is recorded end to end**: 484
+contracts, 242 strikes, C/P balanced, `ask`/`volume` 100%, `iv` and greeks 99.5%,
+two-sided 70%, zero crossed books, zero duplicates, zero delayed rows, sample gap
+flat at the interval. The coverage numbers are in `DECISIONS.md`. Suite: **74
+passed**. Step 2 asks for five consecutive sessions, so **four remain**; the
+launchd agent should get them without intervention.
+
+**A live bug was fixed to get there, and it is worth knowing about.** The spot
+poll asked `reqHistoricalData` for a **60-second** window from an index feed this
+account receives **~16 minutes delayed**. Such a window can never contain a bar,
+so `SpotPoll` failed on its first call and the recorder exited before subscribing
+to anything. The pre-open smoke run never hit it. It is now `2 D` / `1 min`,
+which always spans the lag. Full measurement table in `DECISIONS.md`.
+
+**`spot` is a delayed column.** Good enough to centre the chain, wrong for any
+feature that needs the underlying at quote time — recover that from put-call
+parity on the recorded chain, which stores both rights at all 242 strikes.
 
 **It runs itself.** The launchd agent `com.spx0dte.recorder` is installed and
 active on **port 4001, the live IB Gateway, read-only**:

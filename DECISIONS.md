@@ -224,3 +224,128 @@ the recorder warns when the age exceeds five minutes.
 
 **Reverses if:** the line budget drops below the chain, or a spot source with
 GTH coverage is added (ES futures would be the candidate).
+
+---
+
+## 2026-09-09 — The SPX index feed is delayed ~16 min, and the spot poll asked for a 60-second window
+
+**Corrects the previous entry.** "The index does not print during Global Trading
+Hours" was the wrong diagnosis for a stale `spot`. The index prints fine. This
+account is not entitled to it in real time, so `reqHistoricalData` serves it
+**delayed by about 16 minutes**, and that delay — not the trading session — is
+what decides whether a request returns anything.
+
+Measured against IB Gateway on 4001, a live account, 09:42 and 09:56 ET:
+
+| Request | 09:42 ET (12 min after the open) | 09:56 ET (26 min after) |
+|---|---|---|
+| `60 S` / `1 min` | error 162, no data | never tested; cannot work |
+| `1 D` / `1 min` | error 162, no data | 12 bars, newest 16 min old |
+| `1 D` / `5–30 mins`, `1 hour` | error 162, no data | 1–3 bars, 16–27 min old |
+| `2 D` / `1 min` | not tested | **402 bars, newest 16 min old** |
+| `2 D` / `1 hour` | 7 bars, yesterday's close | — |
+
+The rule the table shows: **a request answers only if its window reaches back
+further than the feed's delay.** `60 S` never can, which is why `SpotPoll` had
+failed on its very first call and the recorder exited with "no SPX print
+available" before subscribing to anything. `1 D` is empty for roughly the first
+20 minutes of every session for the same reason — it is scoped to a day the
+delayed feed has not reached yet — which is why the pre-open smoke run that
+built this code never hit the bug.
+
+Two intermediate conclusions were drawn and discarded on the way, both from
+testing at 09:42 only: that 1-minute bars were not entitled, and that the
+account got no intraday index data at all. Neither is true.
+
+**Decision:** `SPOT_DURATION = "2 D"`, `SPOT_BAR_SIZE = "1 min"`, `use_rth=True`.
+Two days always spans the delay, the overnight and the weekend; 1 min is the
+finest bar served. `SPOT_MAX_AGE` 60 s (one request a minute, far inside the
+~60/10 min limit) and `SPOT_STALE_AFTER` 1800 s, above the normal ~16 min lag so
+the warning means the feed actually stopped.
+
+**`spot` is a delayed column and is never to be used as the spot at quote time.**
+It orders the chain around the money, which tolerates a 16-minute-old centre.
+Anything that needs the underlying *at the timestamp of a quote* — moneyness,
+the SVI fit, every Module A residual — must recover it from **put-call parity**
+on the recorded chain: both rights are stored at all 242 strikes, live and
+entitled, so the forward is derivable per sample at no extra data cost.
+
+**Reverses if:** the account gains a real-time index entitlement (then poll
+`1 D`/`1 min` and drop the parity step), or a GTH spot source is added for the
+pre-open hole, where the poll still legitimately returns the previous close.
+
+## 2026-09-09 — First live session recorded, and the chain is clean
+
+`data/chains/date=2026-09-09/`, sampled every 30 s. Coverage over the first 22
+samples, checked with a script that prints only counts and percentages so no
+quote value leaves the machine:
+
+| | |
+|---|---|
+| Contracts per sample | 484, all of expiry 20260909 |
+| Strikes | 242, 3200–10000, step 5, calls and puts exactly balanced |
+| `ask` / `volume` / `spot` | 100% |
+| `iv` and all four greeks | 99.5% |
+| `open_interest` | 95.2% |
+| `bid` / two-sided | 70.3% — the far wings have no bid, stored **null, never 0.0** |
+| `delayed` rows | 0 — the options are live, only the index is not |
+| Literal `0.0` bid/ask · crossed books · duplicate `(ts, con_id)` | 0 · 0 · 0 |
+| `error_code` values present | none |
+| Quote age | median 3 s, p95 28 s, max 49 s |
+| Sample gap | 20 s median and 20 s max — no drift |
+
+**Reverses if:** a later session shows two-sided coverage collapsing or a
+non-empty `error_code`, either of which would mean an entitlement changed.
+
+## 2026-09-09 — The recorder watched the wrong connection and wrote 8 minutes of frozen quotes
+
+**Found by fault injection: the operator pulled this machine's network at 10:19
+ET while the recorder was running.** That is the cheapest reproduction there is,
+and it should be repeated against any future change to the sampling loop.
+
+TWS logged the farms dropping (`TWS 2103` on `usopt`, `usfarm`, `usfarm.nj`,
+`ushmds`), then `TWS 1100` for lost connectivity, then `1102` restoring it with
+all farms back once the network returned.
+
+**Through the whole outage the recorder kept sampling.** Its guard is
+`self._api.is_connected`, which watches the **socket to TWS** — and IB Gateway
+runs on this same machine, so that socket is a loopback connection that a
+network cut cannot disturb. It stayed up. What broke was the link from **TWS out
+to IBKR**, one layer above anything the guard can see. So the loop wrote the
+last tick of every contract over and over: same schema, no `error_code`,
+`delayed` false, indistinguishable from live data by every field except one.
+
+This is not a hypothetical about IBKR's uptime. Any home network blip, VPN
+switch or Wi-Fi handover produces exactly this, silently.
+
+The signature is unmistakable in `quote_ts`, per-sample median quote age:
+
+    14:19:28Z  36s     14:21:58Z  186s     14:24:28Z  336s
+    14:19:58Z  66s     14:22:28Z  216s     14:24:58Z  366s
+    14:20:28Z  96s     14:22:58Z  246s     14:25:28Z  396s
+    14:20:58Z 126s     14:23:28Z  276s     14:25:58Z  426s
+    14:21:28Z 156s     14:23:58Z  306s     14:26:28Z  456s
+
+Age climbs by exactly the 30 s sample interval every sample: not one new quote
+arrived. **14 samples, 6,776 rows, 15.1% of the session.** It is not confined to
+illiquid strikes — ATM and the far wings froze together, which is what separates
+an outage from thin quoting.
+
+**The data is recoverable.** `quote_ts` is written per row, so the stretch is
+exactly identifiable and filterable after the fact; nothing has to be thrown
+away blind. Recording the tick's own timestamp instead of trusting the sample
+timestamp is what saved the session.
+
+**Decision:** `is_connected` is necessary but not sufficient. The adapter must
+also track farm state from `1100` / `1102` / `2103` / `2105`, and the recorder
+must stop writing while the farms are down rather than repeat a frozen book.
+`1102` says "data maintained" and recovers on its own, so the loop should pause
+and resume, not exit — exiting would hand a self-healing outage to launchd and
+cost a full re-subscription.
+
+**Until that ships, every session must be screened with
+`scripts/verify_chain.py`**, and a per-sample median quote age above roughly the
+sample interval means an outage, not slow quoting.
+
+**Reverses if:** IBKR exposes a single connectivity signal that already covers
+both layers, making the farm bookkeeping redundant.

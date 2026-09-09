@@ -63,16 +63,51 @@ decision.
 
 ---
 
-## OPEN — verify IBKR historical behaviour for 0DTE (roadmap step 1)
+## 2026-09-09 — IBKR historical behaviour for 0DTE, measured (closes the OPEN item)
 
-Two claims drive the whole data plan and are **assumed, not yet measured**:
+Measured with `scripts/spike_historical.py` against **IB Gateway on 4001, a live
+account, read-only**. The adapter refuses to place orders.
 
-1. `Contract.includeExpired` is documented as futures / futures-options only, so
-   expired SPX options are not queryable.
-2. Historical pacing (~60 req / 10 min) makes bulk chain history impractical.
+**Assumption 1 was wrong, but not in the direction that would reorder the roadmap.**
 
-Test both against the live API and record the result here. Half a day of work
-that determines whether steps 2–7 are ordered correctly.
+| Question | Measured |
+|---|---|
+| Expired SPXW resolvable with `includeExpired=True`? | **Yes.** 20260908 7675C, conId 907134620, 14 bars of 30 min, 13 distinct closes, volume 28,499 |
+| How far back? | **One trading day.** Of six weekdays probed, only 20260908 resolved; 20260904 and 20260903 are ordinary trading days and returned error 200 |
+| Today's chain | 242 strikes, 3200-10000 |
+| Yesterday's chain | 250 strikes, 3000-10000 |
+| Pacing, 65 sequential historical requests | **No pushback.** 65/65 round trips in 89 s, 44/min, 7 empty |
+
+Controls were run before believing the first row: a strike that never existed
+(99999C) and an invented expiry (20200101) both return error 200, so TWS does not
+fabricate data for a contract it does not know.
+
+**What this changes:** nothing about module order. Module A still cannot be
+trained on a historical chain, because the window is one day and not one year, so
+**B before A stands**. What it does add is a one-trading-day safety net: if the
+recorder misses a session, the full chain can still be backfilled the next
+morning, and only the next morning. That makes step 2 more valuable, not less,
+and it makes a recorder failure recoverable for exactly one day.
+
+**What would reverse this:** IBKR extending option history retention, or a
+different data source for expired chains. Re-run the spike to check.
+
+**Pacing caveat:** 44 requests/min sustained for 89 s drew no complaint, which is
+looser than the documented ~60 per 10 minutes. The documented figure should still
+be treated as the design constraint for the recorder; one 89-second burst is not
+evidence about sustained load over a full session.
+
+### Two API details that cost time and will again
+
+- `Contract.strike` is initialised to an UNSET sentinel. Writing a real `0.0` to
+  list a whole chain turns it into a filter matching nothing, and TWS answers
+  error 200. Leave it unset instead.
+- Error **162 is overloaded**: it carries both "pacing violation" and "HMDS query
+  returned no data". Branch on the message text, not the code, or an empty
+  pre-market answer reads as throttling.
+- `EWrapper.error` gained a leading `errorTime` argument in TWS API 10.30.
+  `ibkr_adapter` locates `errorCode` as the int before the message string so both
+  layouts work.
 
 ---
 

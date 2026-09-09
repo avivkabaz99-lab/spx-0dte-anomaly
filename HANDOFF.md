@@ -36,21 +36,34 @@ temporary `TEMP_DB_PASSWORD=` line, then build the URI with
 `urllib.parse.quote(pw, safe='')`, write it to `SUPABASE_DB_URL`, and delete the
 temporary line. The value is never printed or pasted into chat.
 
-## 1. Next action — roadmap step 1: the IBKR spike
+## 1. Next action — roadmap step 2: the recorder
 
-Half a day. Two assumptions in `DECISIONS.md` are unverified and order the whole
-roadmap. Measure them with `ibapi` against TWS **paper (7497)**, read-only:
+**Step 1 is done.** `ingest/ibkr_adapter.py` exists (read-only, 16 unit tests, no
+network) and `scripts/spike_historical.py` measured both open assumptions. The
+results and the reasoning are in `DECISIONS.md` under 2026-09-09.
 
-- Can `reqHistoricalData` return anything for a **live** SPXW 0DTE contract intraday?
-- Can it return anything for **yesterday's expired** SPXW contract
-  (`includeExpired=True`)? Expected: no, for index options.
-- What do pacing limits look like across ~50 strikes?
+The finding that matters: expired SPXW chains are retrievable for **exactly one
+trading day**. So module order is unchanged, **B before A**, but a missed
+recording day can be backfilled the next morning and only then.
 
-Write the result into `DECISIONS.md` under the OPEN item. If expired contracts
-*are* retrievable, the B-before-A ordering may flip — re-read SPEC §3.
+Build `ingest/recorder.py`:
 
-Then step 2: `ingest/recorder.py` on a cron, because every trading day without
-it is a day missing from Module A's dataset.
+- Snapshot the SPXW 0DTE chain on a schedule through the session, to Parquet
+  under `data/` (gitignored, raw quotes never leave the machine).
+- Add a backfill path that reads yesterday's expiry, since that window exists.
+  After one day the data is gone for good.
+- Respect the documented ~60 requests / 10 min as the design constraint. The
+  measured 44/min burst is not evidence about sustained load.
+
+Running the spike again:
+
+```bash
+IBKR_PORT=4001 .venv/bin/python scripts/spike_historical.py --pacing 65
+```
+
+`.env` still holds `IBKR_PORT=7497` (TWS paper, currently not running). Port 4001
+is the **live** IB Gateway and is passed per-run on purpose, so no committed
+default points at a live account.
 
 ## 2. Things a new session will not guess
 

@@ -39,3 +39,6 @@ supabase/.temp/
 .DS_Store
 .vscode/
 .idea/
+
+# ---- Runtime logs ----
+logs/

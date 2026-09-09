@@ -74,6 +74,7 @@ class FakeAdapter:
 
     def __init__(self, quotes: dict[int, Quote] | None = None) -> None:
         self._quotes = quotes or {}
+        self.is_connected = True
         self.subscribed: list[int] = []
         self.cancelled: list[int] = []
         self.bars: list[Bar] = []
@@ -288,3 +289,16 @@ def test_refused_lines_are_dropped_so_the_money_is_kept(tmp_path: Path) -> None:
     assert opened == 1
     assert len(api.cancelled) == 2
     assert list(api.quotes().values())[0].strike == float(details[0].con_id)
+
+
+def test_run_stops_when_the_connection_drops(tmp_path: Path) -> None:
+    """Sampling a dead connection would write stale quotes that look valid."""
+    api = FakeAdapter({1: quote()})
+    api.is_connected = False
+    sink = ParquetSink(tmp_path)
+    recorder = Recorder(api, sink, interval=0.01)  # type: ignore[arg-type]
+
+    recorder.run(until=datetime(2099, 1, 1, tzinfo=UTC))
+
+    assert recorder.samples == 0
+    assert sink.buffer == []

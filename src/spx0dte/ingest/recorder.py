@@ -336,6 +336,12 @@ class Recorder:
         deadline = time.monotonic()
         try:
             while not self._stop.is_set() and datetime.now(UTC) < until:
+                # A dropped connection leaves the last tick of every contract in
+                # place, so sampling on would write minutes of stale quotes that
+                # look valid. Stopping lets the launchd agent start a fresh one.
+                if not self._api.is_connected:
+                    logger.error("TWS connection lost after %d samples; stopping", self.samples)
+                    return
                 started = time.monotonic()
                 count = self.sample()
                 logger.debug("sample %d: %d rows in %.2fs",

@@ -48,23 +48,45 @@ chain and was smoke-run live against IB Gateway: 484 contracts, 242 strikes,
 C/P balanced, iv on 100% of rows, two-sided on 70%, ~392k rows and ~21 MB per
 session at a 30-second interval. Suite: **73 passed**.
 
-**Run it (live account, read-only). The session is 09:30-16:15 ET:**
+**It runs itself.** The launchd agent `com.spx0dte.recorder` is installed and
+active on **port 4001, the live IB Gateway, read-only**:
+
+```bash
+launchctl print "gui/$UID/com.spx0dte.recorder" | grep -E "state|runs|last exit"
+tail -f logs/recorder-$(TZ=America/New_York date +%F).log
+./scripts/install_launchd.sh 4001      # reinstall, or change the port
+launchctl bootout "gui/$UID/com.spx0dte.recorder"   # stop recording entirely
+```
+
+The agent fires `scripts/record_session.sh` **every 30 minutes** and the script
+decides. It is not scheduled at the open on purpose: this machine runs on Israel
+time and the local-to-Eastern offset moves between 6 and 8 hours across two
+countries' DST changes, so a fixed local trigger drifts twice a year. Gating on
+Eastern time inside the script is exact all year, and firing often doubles as a
+crash restart — a recorder that dies mid-session is back within half an hour,
+which is what "5 consecutive trading days, zero gaps" actually needs.
+
+The script starts a recorder on weekdays between 09:00 and 16:00 ET, and only if
+one is not already running. Exchange holidays are not listed anywhere: the chain
+resolves empty and the recorder exits saying so. The port lives in the plist,
+never in the repo, so nothing committed points at a live account.
+
+Manual run, if the agent is off:
 
 ```bash
 IBKR_PORT=4001 caffeinate -is .venv/bin/python -m spx0dte.ingest.recorder
 ```
 
-`--interval 30` and a 16:15 ET stop are the defaults. Output goes to
-`data/chains/date=YYYY-MM-DD/part-HHMMSS.parquet`, flushed every 5 minutes.
-`caffeinate` keeps the Mac awake for the whole session; without it a sleep ends
-the recording silently. IB Gateway must stay logged in — it drops the API
-connection on its own daily restart.
+Output: `data/chains/date=YYYY-MM-DD/part-HHMMSS.parquet`, flushed every 5
+minutes. `caffeinate` matters — a Mac that sleeps stops recording silently. The
+recorder stops itself if TWS drops the connection (IB Gateway restarts daily),
+and the agent starts a fresh one on the next fire.
 
 **Still open, in order:**
 
-1. **Cron/launchd**, so the roadmap's "5 consecutive trading days, zero gaps"
-   does not depend on remembering. A launchd agent firing at 09:25 ET is the
-   Mac-native option.
+1. **Watch the first full session end to end.** Verification for roadmap step 2
+   is five consecutive trading days with no gaps; nothing has been recorded for a
+   whole session yet.
 2. **Step 2d, the backfill path.** Yesterday's expiry only — the window is one
    trading day. `reqHistoricalData` with `includeExpired=True`, BID/ASK/TRADES
    at 1 min, and this is where the ~60 requests / 10 min limit does apply, so a

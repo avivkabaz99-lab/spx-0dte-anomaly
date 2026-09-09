@@ -273,6 +273,11 @@ class IBKRAdapter(EWrapper, EClient):
                 self._reader.join(timeout=5.0)
                 self._reader = None
 
+    @property
+    def is_connected(self) -> bool:
+        """False once TWS drops the socket, including its own daily restart."""
+        return bool(self.isConnected())
+
     def __enter__(self) -> IBKRAdapter:
         self.open()
         return self

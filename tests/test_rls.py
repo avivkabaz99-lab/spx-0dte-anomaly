@@ -10,9 +10,11 @@ from __future__ import annotations
 import os
 
 import pytest
+from dotenv import load_dotenv
 
 psycopg = pytest.importorskip("psycopg")
 
+load_dotenv()
 DB_URL = os.environ.get("SUPABASE_DB_URL")
 
 pytestmark = pytest.mark.skipif(

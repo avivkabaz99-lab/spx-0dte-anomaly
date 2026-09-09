@@ -4,9 +4,9 @@
 This adapter turns that into blocking calls that return plain dataclasses, so
 nothing downstream has to know callbacks exist.
 
-The adapter is deliberately read-only. It wraps contract lookup and historical
-bars only, and `placeOrder` is overridden to raise. See the hard rules in
-CLAUDE.md: the IBKR connection never places an order.
+The adapter is deliberately read-only. It wraps contract lookup, historical
+bars and streaming market data only, and `placeOrder` is overridden to raise.
+See the hard rules in CLAUDE.md: the IBKR connection never places an order.
 """
 
 from __future__ import annotations
@@ -34,6 +34,35 @@ _INFO_CODE_MAX = 2200
 # Request ids for market-data requests are ours to allocate and are unrelated to
 # order ids. Starting high keeps them clearly distinct in TWS logs.
 _FIRST_REQUEST_ID = 9000
+
+# Tick ids from `ibapi.ticktype.TickTypeEnum`. Delayed data arrives under its
+# own set of ids, so both are mapped onto the same field and the ticker is
+# flagged, rather than silently recording delayed prices as live ones.
+_PRICE_TICKS: dict[int, str] = {
+    1: "bid", 2: "ask", 4: "last",
+    66: "bid", 67: "ask", 68: "last",
+}
+_SIZE_TICKS: dict[int, str] = {
+    0: "bid_size", 3: "ask_size", 5: "last_size", 8: "volume",
+    27: "open_interest", 28: "open_interest",
+    69: "bid_size", 70: "ask_size", 71: "last_size", 74: "volume",
+}
+_DELAYED_TICKS = frozenset({66, 67, 68, 69, 70, 71, 74, 80, 81, 82, 83})
+
+# Option computations arrive once per side. The model tick is the one that
+# carries a full set of greeks even when the contract is one-sided.
+_MODEL_OPTION_TICKS = frozenset({13, 83})
+
+# TWS refuses a subscription past the account's market-data line budget with
+# this code. Measuring that number is the point of scripts/spike_marketdata.py.
+MAX_TICKERS_CODE = 101
+
+# Partial-entitlement notices. TWS sends one per subscription and then streams
+# the ticks it *is* entitled to, so these describe the feed rather than a
+# failure: 10090 is "part of this data is not subscribed", 10167 is the
+# delayed-data substitution. They are recorded on the quote, but at one
+# subscription per strike they would otherwise flood the log at WARNING.
+MARKET_DATA_NOTICE_CODES = frozenset({10090, 10091, 10167})
 
 
 class IBKRError(RuntimeError):
@@ -81,6 +110,45 @@ class ContractDetail:
     trading_hours: str
 
 
+@dataclass(frozen=True)
+class Quote:
+    """One contract's market data as of `ts`.
+
+    Every numeric field is None until TWS sends it. Missing is not zero: an
+    option with no bid and an option bid at 0.00 are different states, and
+    recording one as the other would corrupt every spread computed downstream.
+    """
+
+    con_id: int
+    local_symbol: str
+    right: str
+    strike: float
+    expiry: str
+    ts: datetime | None = None
+    bid: float | None = None
+    bid_size: float | None = None
+    ask: float | None = None
+    ask_size: float | None = None
+    last: float | None = None
+    last_size: float | None = None
+    volume: float | None = None
+    open_interest: float | None = None
+    iv: float | None = None
+    delta: float | None = None
+    gamma: float | None = None
+    vega: float | None = None
+    theta: float | None = None
+    underlying: float | None = None
+    delayed: bool = False
+    error: str | None = None
+    error_code: int | None = None
+
+    @property
+    def is_two_sided(self) -> bool:
+        """True when both sides are quoted, i.e. the row is usable for a spread."""
+        return self.bid is not None and self.ask is not None
+
+
 class _Request:
     """Mutable state for one in-flight request, resolved by callbacks."""
 
@@ -89,6 +157,47 @@ class _Request:
         self.done = threading.Event()
         self.rows: list[Any] = []
         self.error: IBKRError | None = None
+
+
+class _Ticker:
+    """Mutable state for one streaming subscription, updated by callbacks.
+
+    Unlike `_Request` a subscription has no end: it lives until cancelled, and
+    an error on it is recorded rather than raised, because there is no blocking
+    caller waiting to receive it.
+    """
+
+    def __init__(self, req_id: int, contract: Contract) -> None:
+        self.req_id = req_id
+        self.contract = contract
+        self.values: dict[str, float | None] = {}
+        self.ts: datetime | None = None
+        self.delayed = False
+        self.error: IBKRError | None = None
+
+    def set(self, field: str, value: float | None, *, delayed: bool = False) -> None:
+        self.values[field] = value
+        self.ts = datetime.now(UTC)
+        if delayed:
+            self.delayed = True
+
+
+def _optional_float(value: Any, *, allow_negative: bool = True) -> float | None:
+    """Narrow one IBKR numeric into a float, or None when it means 'no value'.
+
+    IBKR signals 'unset' two different ways: a huge sentinel near DBL_MAX, and
+    -1 on price, size and implied-vol ticks. Greeks are legitimately negative,
+    so the -1 rule is applied only where the caller says it applies.
+    """
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if abs(out) > 1e17:
+        return None
+    if not allow_negative and out < 0:
+        return None
+    return out
 
 
 def _to_float(value: Any) -> float:
@@ -134,6 +243,7 @@ class IBKRAdapter(EWrapper, EClient):
         self._timeout = timeout
         self._lock = threading.Lock()
         self._requests: dict[int, _Request] = {}
+        self._subscriptions: dict[int, _Ticker] = {}
         self._next_request_id = _FIRST_REQUEST_ID
         self._reader: threading.Thread | None = None
         self._ready = threading.Event()
@@ -154,8 +264,9 @@ class IBKRAdapter(EWrapper, EClient):
             )
 
     def close(self) -> None:
-        """Disconnect and let the reader thread finish."""
+        """Cancel every subscription, disconnect, and join the reader thread."""
         try:
+            self.unsubscribe_all()
             self.disconnect()
         finally:
             if self._reader is not None:
@@ -245,6 +356,65 @@ class IBKRAdapter(EWrapper, EClient):
         )
         return [_as_bar(row) for row in self._finish(request)]
 
+    # -- streaming market data ---------------------------------------------
+
+    def set_market_data_type(self, kind: int = 1) -> None:
+        """Choose the data TWS falls back to: 1 live, 2 frozen, 3 delayed, 4 delayed-frozen.
+
+        This is a preference, not a guarantee. TWS answers with the type it
+        actually served through `marketDataType`, which lands on the quote as
+        `delayed`.
+        """
+        self.reqMarketDataType(kind)
+
+    def subscribe(self, contract: Contract, *, generic_ticks: str = "100,101") -> int:
+        """Open a streaming subscription and return its request id.
+
+        The subscription holds one market-data line until `unsubscribe`. Ticks
+        update state in the background; read it with `quotes()`.
+
+        Args:
+            contract: A fully qualified contract.
+            generic_ticks: IBKR generic tick list. 100 is option volume and 101
+                option open interest; greeks arrive without being asked for.
+        """
+        with self._lock:
+            req_id = self._next_request_id
+            self._next_request_id += 1
+            self._subscriptions[req_id] = _Ticker(req_id, contract)
+        self.reqMktData(req_id, contract, generic_ticks, False, False, [])
+        return req_id
+
+    def unsubscribe(self, req_id: int) -> None:
+        """Cancel one subscription and release its line."""
+        with self._lock:
+            ticker = self._subscriptions.pop(req_id, None)
+        if ticker is not None:
+            self.cancelMktData(req_id)
+
+    def unsubscribe_all(self) -> None:
+        """Cancel every subscription. Safe to call twice."""
+        with self._lock:
+            req_ids = list(self._subscriptions)
+            self._subscriptions.clear()
+        for req_id in req_ids:
+            self.cancelMktData(req_id)
+
+    def quotes(self) -> dict[int, Quote]:
+        """Point-in-time copy of every subscription, keyed by request id."""
+        with self._lock:
+            return {rid: _as_quote(t) for rid, t in self._subscriptions.items()}
+
+    def quote(self, req_id: int) -> Quote | None:
+        """One subscription's current state, or None if it is not subscribed."""
+        with self._lock:
+            ticker = self._subscriptions.get(req_id)
+            return _as_quote(ticker) if ticker is not None else None
+
+    def _tick(self, req_id: int) -> _Ticker | None:
+        with self._lock:
+            return self._subscriptions.get(req_id)
+
     # -- EWrapper callbacks ------------------------------------------------
 
     def nextValidId(self, orderId: int) -> None:  # noqa: N802, N803
@@ -271,6 +441,61 @@ class IBKRAdapter(EWrapper, EClient):
         if request is not None:
             request.done.set()
 
+    def tickPrice(self, reqId: int, tickType: int, price: float, attrib: Any = None) -> None:  # noqa: N802, N803
+        field = _PRICE_TICKS.get(tickType)
+        ticker = self._tick(reqId) if field else None
+        if ticker is not None:
+            # -1 on a price tick means "no quote", not a price of minus one.
+            ticker.set(field, _optional_float(price, allow_negative=False),
+                       delayed=tickType in _DELAYED_TICKS)
+
+    def tickSize(self, reqId: int, tickType: int, size: Any) -> None:  # noqa: N802, N803
+        field = _SIZE_TICKS.get(tickType)
+        ticker = self._tick(reqId) if field else None
+        if ticker is not None:
+            ticker.set(field, _optional_float(size, allow_negative=False),
+                       delayed=tickType in _DELAYED_TICKS)
+
+    def tickOptionComputation(  # noqa: N802
+        self,
+        reqId: int,  # noqa: N803
+        tickType: int,  # noqa: N803
+        tickAttrib: int,  # noqa: N803
+        impliedVol: float,  # noqa: N803
+        delta: float,
+        optPrice: float,  # noqa: N803
+        pvDividend: float,  # noqa: N803
+        gamma: float,
+        vega: float,
+        theta: float,
+        undPrice: float,  # noqa: N803
+    ) -> None:
+        """Greeks for one side. Only the model computation is kept.
+
+        The bid and ask computations describe one side of the market; the model
+        tick is TWS's own valuation and is the one field set that stays
+        populated when a side is missing, which for a 0DTE wing is most of the
+        session.
+        """
+        if tickType not in _MODEL_OPTION_TICKS:
+            return
+        ticker = self._tick(reqId)
+        if ticker is None:
+            return
+        delayed = tickType in _DELAYED_TICKS
+        ticker.set("iv", _optional_float(impliedVol, allow_negative=False), delayed=delayed)
+        ticker.set("delta", _optional_float(delta), delayed=delayed)
+        ticker.set("gamma", _optional_float(gamma), delayed=delayed)
+        ticker.set("vega", _optional_float(vega), delayed=delayed)
+        ticker.set("theta", _optional_float(theta), delayed=delayed)
+        ticker.set("underlying", _optional_float(undPrice, allow_negative=False), delayed=delayed)
+
+    def marketDataType(self, reqId: int, marketDataType: int) -> None:  # noqa: N802, N803
+        """TWS reports which data it actually served. 3 and 4 are delayed."""
+        ticker = self._tick(reqId)
+        if ticker is not None and marketDataType >= 3:
+            ticker.delayed = True
+
     def error(self, reqId: int, *args: Any) -> None:  # noqa: N802, N803
         """Handle TWS errors.
 
@@ -284,11 +509,25 @@ class IBKRAdapter(EWrapper, EClient):
             logger.info("TWS %s: %s", code, message)
             return
 
+        if code in MARKET_DATA_NOTICE_CODES:
+            logger.info("TWS %s on request %s: %s", code, reqId, message)
+            ticker = self._tick(reqId)
+            if ticker is not None:
+                ticker.error = IBKRError(code, message, reqId)
+            return
+
         logger.warning("TWS error %s on request %s: %s", code, reqId, message)
         request = self._lookup(reqId)
         if request is not None:
             request.error = IBKRError(code, message, reqId)
             request.done.set()
+            return
+
+        # A subscription has no blocking caller to raise into, so the error is
+        # recorded on the ticker and surfaces on the next `quotes()` read.
+        ticker = self._tick(reqId)
+        if ticker is not None:
+            ticker.error = IBKRError(code, message, reqId)
 
 
 def _split_error_args(args: tuple[Any, ...]) -> tuple[int, str]:
@@ -321,6 +560,22 @@ def _as_bar(raw: Any) -> Bar:
         volume=_to_float(raw.volume),
         wap=_to_float(raw.wap),
         count=int(getattr(raw, "barCount", 0) or 0),
+    )
+
+
+def _as_quote(ticker: _Ticker) -> Quote:
+    c = ticker.contract
+    return Quote(
+        con_id=int(c.conId or 0),
+        local_symbol=c.localSymbol,
+        right=c.right,
+        strike=_to_float(c.strike),
+        expiry=c.lastTradeDateOrContractMonth,
+        ts=ticker.ts,
+        delayed=ticker.delayed,
+        error=ticker.error.message if ticker.error is not None else None,
+        error_code=ticker.error.code if ticker.error is not None else None,
+        **{k: v for k, v in ticker.values.items()},
     )
 
 

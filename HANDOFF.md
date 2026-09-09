@@ -13,6 +13,10 @@
 | Secrets-hygiene tests | OK 12 passed |
 | **RLS tests — the OPRA boundary** | **OK — 27 passed, 0 skipped** |
 
+**Step 1 and step 2a-2b are complete too.** The adapter now also streams market
+data (`subscribe` / `quotes` / `unsubscribe`), and `scripts/spike_marketdata.py`
+measured what this account actually receives. Suite: **55 passed**.
+
 `.env` is filled. `.env.example` untouched, `git status` clean.
 
 ### Connecting to the database — settled, do not re-derive
@@ -36,29 +40,37 @@ temporary `TEMP_DB_PASSWORD=` line, then build the URI with
 `urllib.parse.quote(pw, safe='')`, write it to `SUPABASE_DB_URL`, and delete the
 temporary line. The value is never printed or pasted into chat.
 
-## 1. Next action — roadmap step 2: the recorder
+## 1. Next action — roadmap step 2c: `ingest/recorder.py`
 
-**Step 1 is done.** `ingest/ibkr_adapter.py` exists (read-only, 16 unit tests, no
-network) and `scripts/spike_historical.py` measured both open assumptions. The
-results and the reasoning are in `DECISIONS.md` under 2026-09-09.
+Steps 1, 2a and 2b are done. What they settled, in one line each (full numbers in
+`DECISIONS.md` under 2026-09-09):
 
-The finding that matters: expired SPXW chains are retrievable for **exactly one
-trading day**. So module order is unchanged, **B before A**, but a missed
-recording day can be backfilled the next morning and only then.
+- Expired SPXW chains are retrievable for **exactly one trading day**, so a
+  missed session can be backfilled the next morning and only then.
+- Live SPXW 0DTE quotes **are** entitled; the **whole 484-line chain** can be
+  subscribed at once, so no ATM window is needed.
+- The SPX index is **not** entitled for streaming and `undPrice` never arrives,
+  so spot is derived: a 1-minute historical `IND` poll, cross-checked against
+  put-call parity at the money.
 
 Build `ingest/recorder.py`:
 
-- Snapshot the SPXW 0DTE chain on a schedule through the session, to Parquet
-  under `data/` (gitignored, raw quotes never leave the machine).
-- Add a backfill path that reads yesterday's expiry, since that window exists.
-  After one day the data is gone for good.
-- Respect the documented ~60 requests / 10 min as the design constraint. The
-  measured 44/min burst is not evidence about sustained load.
+- Resolve today's SPXW chain with `reqContractDetails`, subscribe every strike
+  and both rights, sample the local ticker state on a timer (no request per
+  sample — streaming means pacing does not apply), and append to Parquet under
+  `data/` (gitignored; raw quotes never leave the machine).
+- Flush every few minutes so a crash costs minutes, not a session.
+- Treat error **101** as a real condition and fall back to an ATM window; the
+  484-line budget is measured, not guaranteed.
+- Add a backfill path for **yesterday's** expiry via `reqHistoricalData` with
+  `includeExpired=True`. That window is one day wide and is where the historical
+  pacing limit (~60 requests / 10 min) does apply.
 
-Running the spike again:
+Running the spikes again:
 
 ```bash
 IBKR_PORT=4001 .venv/bin/python scripts/spike_historical.py --pacing 65
+IBKR_PORT=4001 .venv/bin/python scripts/spike_marketdata.py --lines 520
 ```
 
 `.env` still holds `IBKR_PORT=7497` (TWS paper, currently not running). Port 4001

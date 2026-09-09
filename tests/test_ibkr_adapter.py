@@ -19,6 +19,7 @@ from ibapi.contract import Contract  # noqa: E402
 
 from spx0dte.config import IBKRConfig  # noqa: E402
 from spx0dte.ingest.ibkr_adapter import (  # noqa: E402
+    MAX_TICKERS_CODE,
     IBKRAdapter,
     IBKRError,
     IBKRTimeoutError,
@@ -224,3 +225,167 @@ def test_request_ids_are_unique(adapter: IBKRAdapter) -> None:
         adapter._finish(request)
 
     assert len(set(seen)) == 3
+
+
+# -- streaming market data -------------------------------------------------
+
+
+def _spxw(strike: float = 6500.0, right: str = "C") -> Contract:
+    c = Contract()
+    c.symbol = "SPX"
+    c.secType = "OPT"
+    c.exchange = "SMART"
+    c.currency = "USD"
+    c.tradingClass = "SPXW"
+    c.lastTradeDateOrContractMonth = "20260909"
+    c.localSymbol = "SPXW  260909C06500000"
+    c.conId = 907134620
+    c.strike = strike
+    c.right = right
+    return c
+
+
+def _subscribed(adapter: IBKRAdapter) -> int:
+    """Subscribe without touching the socket; `reqMktData` needs a connection."""
+    adapter.reqMktData = lambda *a, **k: None  # type: ignore[method-assign]
+    adapter.cancelMktData = lambda *a, **k: None  # type: ignore[method-assign]
+    return adapter.subscribe(_spxw())
+
+
+def test_price_and_size_ticks_build_a_quote(adapter: IBKRAdapter) -> None:
+    req_id = _subscribed(adapter)
+    adapter.tickPrice(req_id, 1, 12.30, None)
+    adapter.tickPrice(req_id, 2, 12.70, None)
+    adapter.tickSize(req_id, 0, 40)
+    adapter.tickSize(req_id, 3, 55)
+    adapter.tickSize(req_id, 8, 28499)
+    adapter.tickSize(req_id, 27, 1234)
+
+    quote = adapter.quote(req_id)
+    assert quote is not None
+    assert (quote.bid, quote.ask) == (12.30, 12.70)
+    assert (quote.bid_size, quote.ask_size) == (40.0, 55.0)
+    assert quote.volume == 28499.0
+    assert quote.open_interest == 1234.0
+    assert quote.is_two_sided
+    assert quote.delayed is False
+    assert quote.con_id == 907134620
+    assert quote.strike == 6500.0
+    assert quote.ts is not None
+
+
+def test_missing_quote_is_none_not_zero(adapter: IBKRAdapter) -> None:
+    """TWS sends -1 for 'no quote'. A wing with no bid must not read as 0.00."""
+    req_id = _subscribed(adapter)
+    adapter.tickPrice(req_id, 1, -1.0, None)
+    adapter.tickPrice(req_id, 2, 0.05, None)
+
+    quote = adapter.quote(req_id)
+    assert quote is not None
+    assert quote.bid is None
+    assert quote.ask == 0.05
+    assert quote.is_two_sided is False
+
+
+def test_delayed_ticks_are_mapped_and_flagged(adapter: IBKRAdapter) -> None:
+    req_id = _subscribed(adapter)
+    adapter.tickPrice(req_id, 66, 12.30, None)
+    adapter.tickPrice(req_id, 67, 12.70, None)
+
+    quote = adapter.quote(req_id)
+    assert quote is not None
+    assert (quote.bid, quote.ask) == (12.30, 12.70)
+    assert quote.delayed is True
+
+
+def test_market_data_type_three_flags_the_quote_as_delayed(adapter: IBKRAdapter) -> None:
+    req_id = _subscribed(adapter)
+    adapter.marketDataType(req_id, 3)
+    assert adapter.quote(req_id).delayed is True
+
+
+def test_model_option_computation_populates_greeks(adapter: IBKRAdapter) -> None:
+    req_id = _subscribed(adapter)
+    adapter.tickOptionComputation(
+        req_id, 13, 0, 0.1432, -0.48, 12.5, 0.0, 0.0021, 0.34, -8.7, 6543.21
+    )
+
+    quote = adapter.quote(req_id)
+    assert quote is not None
+    assert quote.iv == pytest.approx(0.1432)
+    assert quote.delta == pytest.approx(-0.48)
+    assert quote.theta == pytest.approx(-8.7)
+    assert quote.underlying == pytest.approx(6543.21)
+
+
+def test_bid_and_ask_option_computations_are_ignored(adapter: IBKRAdapter) -> None:
+    """Only the model tick is kept; it survives a one-sided market."""
+    req_id = _subscribed(adapter)
+    adapter.tickOptionComputation(
+        req_id, 10, 0, 0.99, 0.9, 12.5, 0.0, 0.0, 0.0, 0.0, 6543.21
+    )
+    assert adapter.quote(req_id).iv is None
+
+
+def test_uncomputable_greeks_become_none(adapter: IBKRAdapter) -> None:
+    req_id = _subscribed(adapter)
+    sentinel = 1.7976931348623157e308
+    adapter.tickOptionComputation(
+        req_id, 13, 0, -1.0, sentinel, sentinel, 0.0, sentinel, sentinel, sentinel, sentinel
+    )
+
+    quote = adapter.quote(req_id)
+    assert quote is not None
+    assert (quote.iv, quote.delta, quote.vega, quote.underlying) == (None, None, None, None)
+
+
+def test_subscription_error_is_recorded_not_raised(adapter: IBKRAdapter) -> None:
+    """A subscription has no blocking caller, so an error must land on the quote."""
+    req_id = _subscribed(adapter)
+    adapter.error(req_id, 0, 354, "Requested market data is not subscribed.", "")
+
+    quote = adapter.quote(req_id)
+    assert quote is not None
+    assert quote.error == "Requested market data is not subscribed."
+
+
+def test_max_tickers_error_reaches_the_caller(adapter: IBKRAdapter) -> None:
+    """The line-budget refusal is identified by code, not by message text."""
+    req_id = _subscribed(adapter)
+    adapter.error(req_id, 0, MAX_TICKERS_CODE, "Max number of tickers has been reached.", "")
+
+    quote = adapter.quote(req_id)
+    assert quote.error_code == MAX_TICKERS_CODE
+    assert "Max number of tickers" in quote.error
+
+
+def test_unsubscribe_drops_the_state(adapter: IBKRAdapter) -> None:
+    req_id = _subscribed(adapter)
+    adapter.tickPrice(req_id, 1, 12.30, None)
+    adapter.unsubscribe(req_id)
+
+    assert adapter.quote(req_id) is None
+    assert adapter.quotes() == {}
+    # A tick arriving after the cancel is in flight, not an error.
+    adapter.tickPrice(req_id, 1, 12.40, None)
+    assert adapter.quotes() == {}
+
+
+def test_unsubscribe_all_cancels_every_line(adapter: IBKRAdapter) -> None:
+    cancelled: list[int] = []
+    adapter.reqMktData = lambda *a, **k: None  # type: ignore[method-assign]
+    adapter.cancelMktData = lambda rid: cancelled.append(rid)  # type: ignore[method-assign]
+    ids = [adapter.subscribe(_spxw(strike)) for strike in (6490.0, 6495.0, 6500.0)]
+
+    adapter.unsubscribe_all()
+    assert cancelled == ids
+    assert adapter.quotes() == {}
+    adapter.unsubscribe_all()  # idempotent
+    assert cancelled == ids
+
+
+def test_ticks_for_an_unknown_request_are_ignored(adapter: IBKRAdapter) -> None:
+    adapter.tickPrice(4242, 1, 12.30, None)
+    adapter.tickSize(4242, 0, 10)
+    adapter.marketDataType(4242, 3)
+    assert adapter.quotes() == {}

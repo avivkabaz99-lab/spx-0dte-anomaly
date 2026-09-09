@@ -26,50 +26,11 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from ibapi.contract import Contract
-
 from spx0dte.config import IBKRConfig
+from spx0dte.ingest.contracts import spx_index, spxw_option
 from spx0dte.ingest.ibkr_adapter import IBKRAdapter, IBKRError, IBKRTimeoutError
 
 logger = logging.getLogger("spike")
-
-
-def spx_index() -> Contract:
-    """The SPX index itself, used to locate the at-the-money strike."""
-    c = Contract()
-    c.symbol = "SPX"
-    c.secType = "IND"
-    c.exchange = "CBOE"
-    c.currency = "USD"
-    return c
-
-
-def spxw_option(
-    expiry: str,
-    strike: float | None = None,
-    right: str = "C",
-    *,
-    include_expired: bool = False,
-) -> Contract:
-    """One SPXW contract, or the whole expiry when `strike` is None.
-
-    Leave `strike` as None to list a chain. Do not pass 0.0 for that: `ibapi`
-    initialises strike to an UNSET sentinel, and writing a real 0.0 turns it
-    into a filter that matches no contract (TWS answers error 200).
-    """
-    c = Contract()
-    c.symbol = "SPX"
-    c.secType = "OPT"
-    c.exchange = "SMART"
-    c.currency = "USD"
-    c.tradingClass = "SPXW"
-    c.lastTradeDateOrContractMonth = expiry
-    if strike is not None:
-        c.strike = strike
-    c.right = right
-    c.multiplier = "100"
-    c.includeExpired = include_expired
-    return c
 
 
 @dataclass

@@ -130,3 +130,54 @@ repo. `scripts/install_ibapi.sh` downloads the pinned official zip, verifies its
 SHA-256, and installs the Python client into `.venv`.
 
 **Reverses if:** IBKR publishes a current `ibapi` on PyPI (then drop the script).
+
+---
+
+## 2026-09-09 — Live market data for the 0DTE chain, measured (sizes the recorder)
+
+Measured with `scripts/spike_marketdata.py` against **IB Gateway on 4001, a live
+account, read-only**, at ~06:00 ET during SPX Global Trading Hours. The adapter
+subscribes, samples and cancels; it never places an order.
+
+| Question | Measured |
+|---|---|
+| Are SPXW 0DTE quotes live or delayed? | **Live.** `delayed 0%` across 484 subscriptions; ATM 7675C quoted 8.20 x9 / 8.40 x36, iv 0.1593, delta 0.309 |
+| Concurrent market-data lines | **≥ 484, no cap reached.** Error 101 (`max tickers`) never arrived; 484 is the entire chain (242 strikes × 2 rights) |
+| Field coverage over the full chain | two-sided **69%**, iv **99%**, greeks **99%**, OI **97%**, volume **100%** |
+| `undPrice` on the greeks | **Never populated — 0%** |
+| Streaming SPX index quote | **Not entitled.** Error 354 on the `IND` contract; delayed is offered, live is not |
+
+**What this decides for the recorder (step 2):**
+
+1. **Record the whole chain, not an ATM window.** The line budget was the reason
+   to narrow it and that reason is gone. 484 lines cost 484 `reqMktData` calls at
+   startup and then zero requests: ticks stream, and sampling reads local state,
+   so the historical pacing limit does not apply to the recorder at all.
+2. **Spot has to be derived, not read.** The index is not entitled for streaming
+   and `undPrice` never arrives, yet `reqHistoricalData` on the same `IND`
+   contract does return bars (that is how the spike finds ATM). So spot comes
+   from a 1-minute historical index poll — 1 request/min against a documented
+   ~6/min budget — with put-call parity at the money as the cross-check.
+3. **Missing is not zero.** 31% of the chain is one-sided at any moment. `Quote`
+   keeps every unset field as `None` and the recorder writes null, so a wing with
+   no bid never reads as a bid of 0.00.
+
+**Two TWS behaviours worth not rediscovering:**
+
+- Error **10090** ("part of requested market data is not subscribed,
+  subscription-independent ticks are still active") arrives on *every* option
+  subscription and is caused by the missing index entitlement. It is a notice,
+  not a failure: bid, ask, iv, greeks and volume all stream normally afterwards.
+  `MARKET_DATA_NOTICE_CODES` in the adapter keeps it off the WARNING channel and
+  off the "this subscription failed" path — the first version of the spike
+  counted it as an error and reported `0 receiving data` while 90% of the chain
+  was quoting.
+- The strike grid is **not uniform**: 5 points near the money widening to 25 in
+  the wings. A synthetic ladder burns lines on contracts that do not exist
+  (error 200, 134 of them in the second run). Build the ladder from
+  `reqContractDetails`.
+
+**What would reverse this:** losing the OPRA subscription, or an account change
+that lowers the line budget below the chain size. The recorder should therefore
+treat error 101 as a real condition and fall back to an ATM window rather than
+assume 484 lines forever.

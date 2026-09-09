@@ -181,3 +181,46 @@ subscribes, samples and cancels; it never places an order.
 that lowers the line budget below the chain size. The recorder should therefore
 treat error 101 as a real condition and fall back to an ATM window rather than
 assume 484 lines forever.
+
+---
+
+## 2026-09-09 — The recorder samples streamed state, it does not request quotes
+
+**Decided:** `ingest/recorder.py` subscribes the entire SPXW 0DTE chain once
+(484 lines), then samples the adapter's local ticker state every 30 seconds and
+appends Parquet parts under `data/chains/date=YYYY-MM-DD/`.
+
+**Why 30 seconds:** ~392k rows and ~21 MB per session, measured from a live
+smoke run. One minute misses intraday 0DTE moves; fifteen seconds doubles the
+volume for detail that the quote itself does not refresh at.
+
+**Why sampling is free:** `reqMktData` streams. A sample is a dict read, not a
+request, so the ~60 requests / 10 min historical limit constrains only the spot
+poll (1 request / 45 s) and the backfill path.
+
+**Why part files:** one file per flush (10 samples, 5 minutes) means a crash
+costs minutes, and the directory is append-only — no rewrite, no lock.
+
+**The line-budget fallback is the subscription order.** Contracts are opened
+nearest-the-money first; anything TWS refuses with error 101 is dropped. If the
+measured 484-line budget ever shrinks, what is lost is the far wing rather than
+the strikes that matter, with no window logic to maintain.
+
+**Two bugs the live smoke run caught that the unit tests did not:**
+
+- Subscribing with a conId-only contract records a chain of **blank strikes**.
+  TWS resolves on `conId` and ignores the rest, but the adapter reads strike,
+  right and expiry back off the contract *it was handed*. `contract_from()` now
+  copies every resolved field. The regression test builds its fake quote from
+  the passed contract, the way the adapter does, so this cannot pass again.
+- Error **10090** was written to `error_code` on all 3,872 rows. It is a
+  session-wide entitlement notice, so it is now stored as null and a real
+  per-contract error stays visible.
+
+**Spot before the open is legitimately stale.** The SPX index does not print
+during Global Trading Hours, so the poll returns the previous 15:59 ET close.
+That is recorded as `spot` with its true `spot_ts`, never as a fresh value, and
+the recorder warns when the age exceeds five minutes.
+
+**Reverses if:** the line budget drops below the chain, or a spot source with
+GTH coverage is added (ES futures would be the candidate).

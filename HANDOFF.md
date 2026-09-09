@@ -13,9 +13,10 @@
 | Secrets-hygiene tests | OK 12 passed |
 | **RLS tests — the OPRA boundary** | **OK — 27 passed, 0 skipped** |
 
-**Step 1 and step 2a-2b are complete too.** The adapter now also streams market
-data (`subscribe` / `quotes` / `unsubscribe`), and `scripts/spike_marketdata.py`
-measured what this account actually receives. Suite: **55 passed**.
+**Steps 1 and 2a-2c are complete too.** The adapter also streams market data
+(`subscribe` / `quotes` / `unsubscribe`), `scripts/spike_marketdata.py` measured
+what this account actually receives, and `ingest/recorder.py` writes the chain to
+Parquet. Suite: **73 passed**.
 
 `.env` is filled. `.env.example` untouched, `git status` clean.
 
@@ -40,33 +41,39 @@ temporary `TEMP_DB_PASSWORD=` line, then build the URI with
 `urllib.parse.quote(pw, safe='')`, write it to `SUPABASE_DB_URL`, and delete the
 temporary line. The value is never printed or pasted into chat.
 
-## 1. Next action — roadmap step 2c: `ingest/recorder.py`
+## 1. Next action — start today's recording, then step 2d (backfill)
 
-Steps 1, 2a and 2b are done. What they settled, in one line each (full numbers in
-`DECISIONS.md` under 2026-09-09):
+Steps 1, 2a, 2b and 2c are done. `ingest/recorder.py` records the full SPXW 0DTE
+chain and was smoke-run live against IB Gateway: 484 contracts, 242 strikes,
+C/P balanced, iv on 100% of rows, two-sided on 70%, ~392k rows and ~21 MB per
+session at a 30-second interval. Suite: **73 passed**.
 
-- Expired SPXW chains are retrievable for **exactly one trading day**, so a
-  missed session can be backfilled the next morning and only then.
-- Live SPXW 0DTE quotes **are** entitled; the **whole 484-line chain** can be
-  subscribed at once, so no ATM window is needed.
-- The SPX index is **not** entitled for streaming and `undPrice` never arrives,
-  so spot is derived: a 1-minute historical `IND` poll, cross-checked against
-  put-call parity at the money.
+**Run it (live account, read-only). The session is 09:30-16:15 ET:**
 
-Build `ingest/recorder.py`:
+```bash
+IBKR_PORT=4001 caffeinate -is .venv/bin/python -m spx0dte.ingest.recorder
+```
 
-- Resolve today's SPXW chain with `reqContractDetails`, subscribe every strike
-  and both rights, sample the local ticker state on a timer (no request per
-  sample — streaming means pacing does not apply), and append to Parquet under
-  `data/` (gitignored; raw quotes never leave the machine).
-- Flush every few minutes so a crash costs minutes, not a session.
-- Treat error **101** as a real condition and fall back to an ATM window; the
-  484-line budget is measured, not guaranteed.
-- Add a backfill path for **yesterday's** expiry via `reqHistoricalData` with
-  `includeExpired=True`. That window is one day wide and is where the historical
-  pacing limit (~60 requests / 10 min) does apply.
+`--interval 30` and a 16:15 ET stop are the defaults. Output goes to
+`data/chains/date=YYYY-MM-DD/part-HHMMSS.parquet`, flushed every 5 minutes.
+`caffeinate` keeps the Mac awake for the whole session; without it a sleep ends
+the recording silently. IB Gateway must stay logged in — it drops the API
+connection on its own daily restart.
 
-Running the spikes again:
+**Still open, in order:**
+
+1. **Cron/launchd**, so the roadmap's "5 consecutive trading days, zero gaps"
+   does not depend on remembering. A launchd agent firing at 09:25 ET is the
+   Mac-native option.
+2. **Step 2d, the backfill path.** Yesterday's expiry only — the window is one
+   trading day. `reqHistoricalData` with `includeExpired=True`, BID/ASK/TRADES
+   at 1 min, and this is where the ~60 requests / 10 min limit does apply, so a
+   full chain is not backfillable: pick an ATM window and pace it.
+3. **A GTH spot source.** The index does not print outside regular hours, so
+   pre-open rows carry the previous close with an honest `spot_ts`. ES futures
+   would fix it if pre-open data ever matters.
+
+Re-running the spikes:
 
 ```bash
 IBKR_PORT=4001 .venv/bin/python scripts/spike_historical.py --pacing 65

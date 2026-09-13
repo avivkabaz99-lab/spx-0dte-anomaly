@@ -9,14 +9,19 @@ from __future__ import annotations
 from ibapi.contract import Contract
 
 
-def spx_index() -> Contract:
-    """The SPX index itself, used to locate the at-the-money strike."""
+def cboe_index(symbol: str) -> Contract:
+    """A CBOE-listed index: SPX, VIX, VIX1D, VIX9D."""
     c = Contract()
-    c.symbol = "SPX"
+    c.symbol = symbol
     c.secType = "IND"
     c.exchange = "CBOE"
     c.currency = "USD"
     return c
+
+
+def spx_index() -> Contract:
+    """The SPX index itself, used to locate the at-the-money strike."""
+    return cboe_index("SPX")
 
 
 def spxw_option(

@@ -42,3 +42,6 @@ supabase/.temp/
 
 # ---- Runtime logs ----
 logs/
+
+# Session state (global CLAUDE.md §13)
+HANDOFF.md
